@@ -100,6 +100,14 @@ namespace ShoutLibTest
             return Convert.ToBase64String(json);
         }
 
+        string GetLogText()
+        {
+            _memStream.Seek(0, SeekOrigin.Begin);
+            var buffer = new byte[_memStream.Length];
+            var bytesRead = _memStream.Read(buffer, 0, buffer.Length);
+            return Encoding.UTF8.GetString(buffer);
+        }
+
         [Fact]
         void TestMissingAttributes()
         {
@@ -107,15 +115,32 @@ namespace ShoutLibTest
             {
                 Messages = new PubsubMessage[] { new PubsubMessage()
                 {
-                    Data = EncodeData("bogus")
+                    Data = EncodeData("hello")
                 } }
             }, _topicPath).Execute();
             _shouter.ShoutOrThrow(new System.Threading.CancellationTokenSource().Token);
-            _memStream.Seek(0, SeekOrigin.Begin);
-            var buffer = new byte[_memStream.Length];
-            var bytesRead = _memStream.Read(buffer, 0, buffer.Length);
-            string log = System.Text.Encoding.UTF8.GetString(buffer);
-            Assert.True(log.Contains("Bad shout request message attributes"));
+            Assert.True(GetLogText().Contains("Bad shout request message attributes"));
+        }
+
+        [Fact]
+        void TestExpired()
+        {
+            _pubsub.Projects.Topics.Publish(new PublishRequest()
+            {
+                Messages = new PubsubMessage[] { new PubsubMessage()
+                {
+                    Data = EncodeData("hello"),
+                    Attributes = new Dictionary<string, string>
+                    {
+                        {"postStatusUrl", "https://localhost/" },
+                        {"postStatusToken", "token" },
+                        {"deadline", "0" },
+                    }                    
+                } }
+            }, _topicPath).Execute();
+            _shouter.ShoutOrThrow(new System.Threading.CancellationTokenSource().Token);
+            string logText = GetLogText();
+            Assert.True(logText.Contains("Bad shout request message attributes"), logText);
         }
     }
 }
