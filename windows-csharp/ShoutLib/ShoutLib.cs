@@ -64,25 +64,35 @@ namespace ShoutLib
             /// A random number generator.
             /// </summary>
             public System.Random Random;
-        }
 
-        private Initializer init;
-
-        public Shouter(LogWriter logWriter = null)
-        {
-            init = new Initializer();
-            init.LogWriter = logWriter;
-            init.Random = new Random();
-            var credentials = Google.Apis.Auth.OAuth2.GoogleCredential.GetApplicationDefaultAsync().Result;
-            credentials = credentials.CreateScoped(new[] { Google.Apis.Pubsub.v1.PubsubService.Scope.Pubsub });
-            init.PubsubService = new PubsubService(new BaseClientService.Initializer()
+            public static Initializer CreateDefault()
             {
-                ApplicationName = Constants.UserAgent,
-                HttpClientInitializer = credentials,
-            });
-            init.HttpClient = new HttpClient();
+                var init = new Initializer();
+                init.Random = new Random();
+                var credentials = Google.Apis.Auth.OAuth2.GoogleCredential.GetApplicationDefaultAsync().Result;
+                credentials = credentials.CreateScoped(new[] { PubsubService.Scope.Pubsub });
+                init.PubsubService = new PubsubService(new BaseClientService.Initializer()
+                {
+                    ApplicationName = Constants.UserAgent,
+                    HttpClientInitializer = credentials,
+                });
+                init.HttpClient = new HttpClient();
+                return init;
+            }
         }
 
+        private Initializer _init;
+
+        public Shouter(Initializer init = null)
+        {
+            _init = init ?? Initializer.CreateDefault();
+        }
+
+        public Shouter(LogWriter logWriter)
+        {
+            _init = Initializer.CreateDefault();
+            _init.LogWriter = logWriter;
+        }
         /// <summary>
         /// Waits for a shout request message to arrive in the Pub/Sub
         /// subscription.  Converts the text to uppercase and posts the results 
@@ -95,10 +105,10 @@ namespace ShoutLib
         public int ShoutOrThrow(System.Threading.CancellationToken cancellationToken)
         {
             // Pull a shout request message from the subscription.
-            string subscriptionPath = MakeSubscriptionPath(init.SubscriptionName);
+            string subscriptionPath = MakeSubscriptionPath(_init.SubscriptionName);
             WriteLog("Pulling shout request messages from " + subscriptionPath +"...",
                 TraceEventType.Verbose);
-            var pullRequest = init.PubsubService.Projects.Subscriptions.Pull(
+            var pullRequest = _init.PubsubService.Projects.Subscriptions.Pull(
                 new PullRequest()
             {
                 MaxMessages = 1,
@@ -159,12 +169,12 @@ namespace ShoutLib
                     {
                         // Tell the subscription we need more time:
                         WriteLog("Need more time...", TraceEventType.Verbose);
-                        init.PubsubService.Projects.Subscriptions.ModifyAckDeadline(
+                        _init.PubsubService.Projects.Subscriptions.ModifyAckDeadline(
                             new ModifyAckDeadlineRequest
                         {
                             AckIds = new string[] { shoutRequestMessage.AckId },
                             AckDeadlineSeconds = 15,
-                        }, MakeSubscriptionPath(init.SubscriptionName)).Execute();
+                        }, MakeSubscriptionPath(_init.SubscriptionName)).Execute();
                         ackDeadline = now + tenSeconds;
                     }
                 };
@@ -229,7 +239,7 @@ namespace ShoutLib
             if (upperText.Contains("CORN"))
             {
                 // Simulate a flaky error that happens sometimes, but not always.
-                if (init.Random.Next(3) > 0)
+                if (_init.Random.Next(3) > 0)
                     throw new CornException();
             }
             if (upperText.Contains("COW"))
@@ -256,7 +266,7 @@ namespace ShoutLib
                 {"token", postStatusToken},
                 {"result", result},
                 {"host", System.Environment.MachineName}});
-            var httpPost = init.HttpClient.PostAsync(postStatusUrl, content);
+            var httpPost = _init.HttpClient.PostAsync(postStatusUrl, content);
             httpPost.Wait();
             if (httpPost.Result.StatusCode != System.Net.HttpStatusCode.OK)
             {
@@ -271,10 +281,10 @@ namespace ShoutLib
         private void Acknowledge(string ackId)
         {
             WriteLog("Deleting shout request message...", TraceEventType.Verbose);
-            init.PubsubService.Projects.Subscriptions.Acknowledge(new AcknowledgeRequest()
+            _init.PubsubService.Projects.Subscriptions.Acknowledge(new AcknowledgeRequest()
             {
                 AckIds = new string[] { ackId }
-            }, MakeSubscriptionPath(init.SubscriptionName)).Execute();
+            }, MakeSubscriptionPath(_init.SubscriptionName)).Execute();
         }
 
         /// <summary>
@@ -306,14 +316,14 @@ namespace ShoutLib
         /// </summary>
         private void WriteLog(string message, TraceEventType severity = TraceEventType.Information)
         {
-            if (init.LogWriter == null || !init.LogWriter.IsLoggingEnabled())
+            if (_init.LogWriter == null || !_init.LogWriter.IsLoggingEnabled())
                 return;
             LogEntry entry = new LogEntry()
             {
                 Message = message,
                 Severity = severity
             };
-            init.LogWriter.Write(entry);
+            _init.LogWriter.Write(entry);
         }
 
         /// <summary>
@@ -331,7 +341,7 @@ namespace ShoutLib
         /// </summary>
         private string MakeSubscriptionPath(string subscription)
         {
-            return "projects/" + init.ProjectId + "/subscriptions/" + subscription;
+            return "projects/" + _init.ProjectId + "/subscriptions/" + subscription;
         }
 
         /// <summary>
@@ -339,7 +349,7 @@ namespace ShoutLib
         /// </summary>
         private string MakeTopicPath(string topic)
         {
-            return "projects/" + init.ProjectId + "/topics/" + topic;
+            return "projects/" + _init.ProjectId + "/topics/" + topic;
         }
     }
 
