@@ -26,9 +26,23 @@ using Microsoft.Practices.EnterpriseLibrary.Logging.Formatters;
 using System.IO;
 using Newtonsoft.Json;
 using System.Diagnostics;
+using System.Net.Http;
+using System.Threading;
 
 namespace ShoutLibTest
 {
+    public class MockMessageHandler : HttpMessageHandler
+    {
+        public Func<HttpRequestMessage, HttpResponseMessage> Handler { get; set; }
+
+        protected override Task<HttpResponseMessage> 
+            SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            return Handler == null ? Task.FromResult(new HttpResponseMessage())
+                : Task.FromResult(Handler(request));
+        }
+    }
+
     public class Test
     {
         private readonly PubsubService _pubsub;
@@ -36,19 +50,23 @@ namespace ShoutLibTest
         private readonly string _subscriptionPath;
         private readonly Shouter _shouter;
         private readonly MemoryStream _memStream;
-        private bool _createdTopicAndSubscription = false;
+        private static bool _createdTopicAndSubscription = false;
+        private readonly MockMessageHandler _httpMessageHandler;
 
         public Test()
         {
+            _httpMessageHandler = new MockMessageHandler();
             _memStream = new MemoryStream();
             var init = Shouter.Initializer.CreateDefault();
             init.LogWriter = CreateLogWriter(_memStream);
+            init.HttpClient = new HttpClient(_httpMessageHandler);
             _pubsub = init.PubsubService;
             init.SubscriptionName += "-test";
             init.ProjectId = Environment.GetEnvironmentVariable("GOOGLE_PROJECT_ID");
             _topicPath = $"projects/{init.ProjectId}/topics/{init.SubscriptionName}-topic";
             _subscriptionPath = $"projects/{init.ProjectId}/subscriptions/{init.SubscriptionName}";
             CreateTopicAndSubscription();
+            ClearSubscription();
             _shouter = new Shouter(init);
         }
 
@@ -94,10 +112,29 @@ namespace ShoutLibTest
             }
         }
 
+        void ClearSubscription()
+        {
+            while (true)
+            {
+                var pullResponse = _pubsub.Projects.Subscriptions.Pull(
+                    new PullRequest()
+                    {
+                        MaxMessages = 100,
+                        ReturnImmediately = true
+                    }, _subscriptionPath).Execute();
+                if (pullResponse.ReceivedMessages == null
+                    || pullResponse.ReceivedMessages.Count == 0)
+                    break;
+                _pubsub.Projects.Subscriptions.Acknowledge(new AcknowledgeRequest()
+                {
+                    AckIds = (from msg in pullResponse.ReceivedMessages select msg.AckId).ToList()
+                }, _subscriptionPath).Execute();
+            }
+        }
+
         string EncodeData(string message)
         {
-            byte[] json = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(message));
-            return Convert.ToBase64String(json);
+            return Convert.ToBase64String(Encoding.UTF8.GetBytes(message));
         }
 
         string GetLogText()
@@ -106,6 +143,13 @@ namespace ShoutLibTest
             var buffer = new byte[_memStream.Length];
             var bytesRead = _memStream.Read(buffer, 0, buffer.Length);
             return Encoding.UTF8.GetString(buffer);
+        }
+
+        static public long FutureUnixTime(long secondsFromNow)
+        {
+            var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var elapsed = DateTime.UtcNow - epoch;
+            return (long)elapsed.TotalSeconds + secondsFromNow;
         }
 
         [Fact]
@@ -125,6 +169,14 @@ namespace ShoutLibTest
         [Fact]
         void TestExpired()
         {
+            _httpMessageHandler.Handler = request =>
+            {
+                Assert.Equal("https://localhost/", request.RequestUri.OriginalString);
+                string content = request.Content.ReadAsStringAsync().Result;
+                var query = System.Web.HttpUtility.ParseQueryString(content);
+                Assert.Equal("AladdinsCastle", query["token"]);
+                return new HttpResponseMessage();
+            };
             _pubsub.Projects.Topics.Publish(new PublishRequest()
             {
                 Messages = new PubsubMessage[] { new PubsubMessage()
@@ -133,14 +185,81 @@ namespace ShoutLibTest
                     Attributes = new Dictionary<string, string>
                     {
                         {"postStatusUrl", "https://localhost/" },
-                        {"postStatusToken", "token" },
+                        {"postStatusToken", "AladdinsCastle" },
                         {"deadline", "0" },
                     }                    
                 } }
             }, _topicPath).Execute();
             _shouter.ShoutOrThrow(new System.Threading.CancellationTokenSource().Token);
             string logText = GetLogText();
-            Assert.True(logText.Contains("Bad shout request message attributes"), logText);
+            Assert.Contains("Request timed out.", logText);
+        }
+
+        [Fact]
+        void TestHello()
+        {
+            bool sawHello = false;
+            _httpMessageHandler.Handler = request =>
+            {
+                Assert.Equal("https://localhost/", request.RequestUri.OriginalString);
+                string content = request.Content.ReadAsStringAsync().Result;
+                var query = System.Web.HttpUtility.ParseQueryString(content);
+                Assert.Equal("AladdinsCastle", query["token"]);
+                if ("success" == query["status"])
+                    sawHello = "HELLO" == query["result"];
+                return new HttpResponseMessage();
+            };
+            _pubsub.Projects.Topics.Publish(new PublishRequest()
+            {
+                Messages = new PubsubMessage[] { new PubsubMessage()
+                {
+                    Data = EncodeData("hello"),
+                    Attributes = new Dictionary<string, string>
+                    {
+                        {"postStatusUrl", "https://localhost/" },
+                        {"postStatusToken", "AladdinsCastle" },
+                        {"deadline",  FutureUnixTime(30).ToString() },
+                    }
+                } }
+            }, _topicPath).Execute();
+            _shouter.ShoutOrThrow(new System.Threading.CancellationTokenSource().Token);
+            Assert.True(sawHello);
+            string logText = GetLogText();
+            Assert.False(logText.Contains("Request timed out."), logText);
+        }
+
+        [Fact]
+        void TestChickenError()
+        {
+            bool succeeded = false;
+            _httpMessageHandler.Handler = request =>
+            {
+                Assert.Equal("https://localhost/", request.RequestUri.OriginalString);
+                string content = request.Content.ReadAsStringAsync().Result;
+                var query = System.Web.HttpUtility.ParseQueryString(content);
+                Assert.Equal("AladdinsCastle", query["token"]);
+                if ("success" == query["status"])
+                    succeeded = true;
+                return new HttpResponseMessage();
+            };
+            _pubsub.Projects.Topics.Publish(new PublishRequest()
+            {
+                Messages = new PubsubMessage[] { new PubsubMessage()
+                {
+                    Data = EncodeData("chickens"),
+                    Attributes = new Dictionary<string, string>
+                    {
+                        {"postStatusUrl", "https://localhost/" },
+                        {"postStatusToken", "AladdinsCastle" },
+                        {"deadline",  FutureUnixTime(30).ToString() },
+                    }
+                } }
+            }, _topicPath).Execute();
+            _shouter.ShoutOrThrow(new System.Threading.CancellationTokenSource().Token);
+            string logText = GetLogText();
+            Assert.False(succeeded);
+            Assert.Contains("Fatal", logText);
+            Assert.Contains("Oh no!", logText);
         }
     }
 }
